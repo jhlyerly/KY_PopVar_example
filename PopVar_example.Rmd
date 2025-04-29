@@ -1,0 +1,561 @@
+---
+title: "PopVar Example"
+author: "Jeanette Lyerly"
+date: "2024-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Purpose
+
+This is an example for running the PopVar function for winter wheat to predict crosses for a list of parents using a regional nursery training population.   
+
+Training population data is curated historical nursery data. Input for GS is lsmeans for nursery entries over environments (year + location).
+
+A list of 2024 Advanced Test (AT24) lines will be the potential parents. We want to predict crosses with these lines and make some decisions about which crosses would be best.
+
+Load libraries.
+
+```{r Load libraries and set working directories, results="hide"}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(rrBLUP)
+library(PopVar)
+library(knitr)
+library(kableExtra)
+library(here)
+library(readxl)
+library(openxlsx)
+
+```
+
+### Load the phenotype data
+
+Data is stored in a csv file. This is the historical phenotype data for the Mason-Dixon regional nursery.
+
+```{r}
+
+phenotype_data <- read_csv(here::here("input_files", "phenotype_data.csv"), guess_max = 10000, na = c("NA", ""))
+#check the loaded data
+glimpse(phenotype_data)
+
+```
+Here we have a variable called "ID" and data for seven traits - yield, test weight, heading date, plant height, powdery mildew 0-9, leaf rust 0-9, and FHB 0-9.
+
+### Load the genotype data
+
+This is filtered, imputed SNP data. 
+
+```{r}
+
+genotype_data <- as.data.frame(read_csv(here::here("input_files", "genotype_data.csv"), guess_max = 10000, na = c("NA", "")))
+genotype_data[1:10, 1:10] #SNP across the top, lines down the side
+
+```
+
+Again, we have a variable called "ID" and some genotype data. SNP are labeled with chromosome and order information - S1A_001 is the first SNP on chromosome 1A.
+
+SNP are coded as 0, 1, 2.
+
+### Formatting
+
+To use the SNP data we need to have it coded as -1, 0, 1.
+
+```{r}
+
+genotype_data <- genotype_data %>%
+  mutate(across(-c(ID), ~  . - 1))
+
+dim(genotype_data)
+
+```
+
+We have about 4600 SNP in this data set to work with.
+
+### Load the map
+
+In order to run PopVar you need a map with cM positions. This map is associated with the example genotype file and has cM and SNP positions.
+
+```{r}
+
+#this is the map
+SNP_map <- read_csv(here::here("input_files", "SNP_map.csv"), guess_max = 10000, na = c("NA", ""))
+
+#make sure the map matches the genotype file
+identical(SNP_map$SNP, colnames(genotype_data[,-c(1)])) #check that this is correct - should return TRUE
+#if this does not return TRUE then something is out of order - arrange the chr and pos variables and check again
+
+```
+
+
+### Load the list of parents to use
+
+In this example we will use the 2024 AT lines for our list of parents. These lines will have genotype data, but no phenotype data yet. 
+
+```{r}
+
+AT24_entries <- read_csv(file = here::here("input_files", "parents.csv"), na = c("NA", ""))
+glimpse(AT24_entries)
+
+#if you have checks that are duplicated they should be removed
+AT24_entries <- AT24_entries %>% 
+  filter(!duplicated(ID))
+
+```
+
+### Add the parents to the phenotype data
+
+The parents will not have phenotype data (except for checks), so those will be filled with NA.
+
+```{r}
+
+pheno_all <- merge(x = phenotype_data, y = AT24_entries, all = TRUE) #add the 2024 Nursery lines to the phenotype file; the 2024 lines do not have any pheno data so are filled with NA
+view(pheno_all)
+
+```
+
+Now we have a data set where some samples have phenotype data, and some do not (the ones we are predicting). We can also see that in our historical data some lines have data for traits and others do not. This is typical of historical data, where every location/year may not have been able to collect data for a trait.
+
+### Check phenotype and genotype data
+
+Our genotype and phenotype data frames need to match with the same samples. If a sample doesn't have genotype data (plant didn't grow, etc) then we need to remove it from the data set - we will not be able to predict it.
+
+```{r}
+
+#remove anything with no genotype data
+#we will use the values with no punctuation to be sure we are accounting for any variation in naming conventions
+dim(pheno_all)
+pheno_all <- pheno_all %>%
+  dplyr::filter(ID %in% genotype_data$ID)
+dim(pheno_all) #three lines are removed
+
+
+#we need the parents as character for input
+#we will need to remove anything with no genotype data
+parents <- AT24_entries %>% 
+  select(ID) %>%                
+  filter(!duplicated(ID)) %>%   #remove any duplicates (checks, etc)
+  filter(ID %in% pheno_all$ID, ID %in% genotype_data$ID) #remove anything with no genotype data - we already checked the list above so we can use that
+parents <- as.character(as.matrix(parents))
+
+```
+
+
+### Look at the marker distributions
+
+Here we will look at the marker distribution over the data set. We want this to be representative - if you are thinning the SNP set or selecting markers it's always a good idea to check your distributions.
+
+```{r}
+#Plot the densities of snps in the file, facet wrap for chr
+
+ggplot(SNP_map %>% filter(chr %in% c("1A", "1B", "1D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + # separate plots for each chr, x-scales can differ from chr to chr
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr1.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("2A", "2B", "2D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr2.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("3A", "3B", "3D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr3.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("4A", "4B", "4D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr4.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("5A", "5B", "5D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr5.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("6A", "6B", "6D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr6.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+ggplot(SNP_map %>% filter(chr %in% c("7A", "7B", "7D"))) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + 
+  ggtitle("Density of SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+ggsave(here::here("output_files", "SNP_dist_plots", "SNPdensityChr7.pdf"), plot = last_plot(), height = 8, width = 10, units = "in")
+
+```
+
+We will also run a marker count.
+
+```{r}
+
+kable(SNP_map %>% group_by(chr) %>% count()) %>% kable_styling()
+
+```
+
+Based on the counts, 3D, 4D and 6D have the lowest numbers. Fewer markers for the D chromosomes is typical for winter wheat.   
+
+All the markers could be used, or you can make a smaller subset for PopVar. The run time will be longer for a larger number of markers. In this example we will make a subset, but you could also try them all.
+
+## Subset markers
+
+Here we will make a subset of markers. 
+
+```{r}
+
+#add some rownames, double check we have things in the right order
+rownames(genotype_data) <- genotype_data$ID
+genotype_data <- genotype_data[,-c(1)]
+identical(SNP_map$SNP, colnames(genotype_data))
+
+nMrkToKeep <- 500 #select a number of markers to use - here we will select 500
+
+#sample the data
+mytoKeep <- genotype_data[sort(sample(length(genotype_data), nMrkToKeep))] #sample from the marker data
+mymarklist <- colnames(mytoKeep) #make a list of the markers
+
+mymapInfoPV <- as.data.frame(SNP_map[SNP_map$SNP %in% mymarklist,]) #get the selected ones from the map file
+
+identical(mymapInfoPV$SNP, colnames(mytoKeep)) #make sure these names match
+table(mymapInfoPV$chr) #look at your sample by chromosome - is this representative?
+
+#plot the selected markers - always good to check distributions
+ggplot(mymapInfoPV) + 
+  geom_histogram(aes(x = cM), binwidth=1) + # pick a binwidth that is not too small 
+  facet_wrap(~ chr) + # seperate plots for each chr, x-scales can differ from chr to chr
+  ggtitle("Density of selected SNP") +
+  xlab("Position in the genome") + 
+  ylab("SNP density") + 
+  theme_bw()
+
+```
+
+Chromosome 4D is a bit sparse. The D chromosomes generally have fewer available SNP. More markers in this subset would give better coverage, but for the sake of this example we will run with these 500.
+
+## Format data and run PopVar
+
+Each simulated population will have 200 individuals.
+
+The formatting is a little picky in that PopVar wants the marker matrix to have the names of taxa and markers **in the matrix itself** rather than as row names and column names.   
+
+```{r}
+#do the formatting for PopVar with the row and col names inside the matrix
+#this is a bit clunky for fixing the formatting but is effective
+firstrow <- c(colnames(mytoKeep)) #get the first row information
+firstcol <- c("name", rownames(mytoKeep)) #get the first column information
+mymrkMapPV1 <- rbind(firstrow, mytoKeep) #bind the row and the data frame
+mymrkMapPV2 <- cbind(firstcol, mymrkMapPV1) #bind the column and the data frame
+
+#list the traits you are using
+traits <- c("YLD_BUPA", "TW_LBBU", "HD_JUL", "HT_IN", "PMD09", "LFRUST09", "FHB09")
+
+#run the pop.predict function
+popVarOut <- pop.predict(G.in=mymrkMapPV2, 
+                         y.in=pheno_all[,c("ID", traits)], 
+                         map.in=mymapInfoPV, 
+                         parents=parents, 
+                         models = c("rrBLUP"), 
+                         nSim=25, 
+                         nInd = 200)
+
+pred_out <- as.data.frame(popVarOut$predictions) #get the predictions
+pred_out <- data.frame(lapply(pred_out, unlist), stringsAsFactors=FALSE) #format the output
+
+#do some housekeeping
+pred_out <- pred_out %>% 
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+#add back in the formatted sample names from the entry list
+pred_out <- pred_out %>% 
+  mutate(ID = YLD_BUPA_param.df.Par1) %>% 
+  dplyr::inner_join(., AT24_entries[,c("ID")], by = "ID") %>% 
+  rename(Parent1 = ID) %>%
+  dplyr::select(Parent1, everything())
+
+pred_out <- pred_out %>% 
+  mutate(ID = YLD_BUPA_param.df.Par2) %>% 
+  dplyr::inner_join(., y = AT24_entries[,c("ID")], by = "ID") %>% 
+  rename(Parent2 = ID) %>% 
+  dplyr::select(Parent1, Parent2, everything())
+
+#save the output
+write.csv(pred_out, file = here::here("output_files", "PopVar_results.csv"), row.names = F)
+
+```
+
+### Troubleshooting
+
+Sometimes the formatting trips people up, even for code that ran before. Package updates and changes to functions can result in errors.
+Things to check:   
+Is the genotype data and the map in the same order?
+Are all the lines in the phenotype file in the genotype file?
+Do the line names match?
+Are all your input structures data frames?
+
+
+### Look at the output
+
+In this example we've generated all possible crosses with the lines in this regional nursery. 
+
+```{r}
+
+nrow(pred_out)
+
+```
+
+That's almost 2800 crosses! We probably don't want to make that many. We could sort our output data frame to decide which ones we might like best.
+
+```{r}
+#table with the top 10% for yield
+top_yield <- pred_out %>%
+  dplyr::select(Parent1, Parent2, YLD_BUPA_param.df.pred.mu) %>%
+  slice_max(YLD_BUPA_param.df.pred.mu, prop = 0.1)
+
+view(top_yield)
+
+#table with the top 10% for test weight
+top_testwt <- pred_out %>%
+  dplyr::select(Parent1, Parent2, TW_LBBU_param.df.pred.mu) %>%
+  slice_max(TW_LBBU_param.df.pred.mu, prop = 0.10)
+
+view(top_testwt)
+
+#what if we want yield and test weight?
+top_yield_testwt <- inner_join(top_yield, top_testwt)
+view(top_yield_testwt)
+
+#what about our disease resistance?
+#table with the top 10% for yield and the top 10% (in this case the lowest 10%) for leaf rust
+top_rust <- pred_out %>%
+  dplyr::select(Parent1, Parent2, LFRUST09_param.df.pred.mu) %>%
+  slice_min(LFRUST09_param.df.pred.mu, prop = 0.10)
+
+view(top_rust)
+
+top_yield_rust <- inner_join(top_yield, top_rust)
+view(top_yield_rust)
+
+```
+
+We can make tables with different combinations that are of interest.
+
+### Identify and visualize the best crosses for two traits
+
+Next we could visualize two traits using the predicted mean of the crosses.   
+- Identify the best percentage from each (top 10%, top 20%, etc).   
+- Graph and highlight.
+- Make a table showing how many times a parent was selected in that top percentage.
+
+First, define some functions to make this easier. These functions apply to the traits where the best is high values for both traits - yield, test weight, etc.
+
+```{r}
+
+#make the data frame
+#add variables for selecting crosses
+make_viz_data1 <- function(df, input_list) {
+  n <- input_list$n
+  df_viz <- df %>%
+    dplyr::select(Parent1, Parent2, all_of(input_list$x_list), all_of(input_list$y_list)) %>%
+    dplyr::filter(!duplicated(.))
+  df_viz <- df_viz %>%
+    mutate(highx = ifelse(df_viz[,input_list$x_trait] > quantile(df_viz[,input_list$x_trait], prob = (1 - n/100), na.rm = T), "yes", "no"),
+           highy = ifelse(df_viz[,input_list$y_trait] > quantile(df_viz[,input_list$y_trait], prob = (1 - n/100), na.rm = T), "yes", "no"))
+  df_viz <- df_viz %>%
+    mutate(best = ifelse(highx == "yes" & highy == "yes", "yes", "no"))
+  return(df_viz)
+}
+
+#make the plot
+plot_viz_data1 <- function(df, input_list) {
+  n = input_list$n
+  best_plot <- ggplot(df) +
+    geom_point(aes(x = get(input_list$x_trait), y = get(input_list$y_trait), color = best)) +
+    scale_color_manual(values = c("gray", "green")) +
+    geom_hline(aes(yintercept = quantile(df[,input_list$y_trait], prob = (1 - n/100), na.rm = T)), color = "red", linetype = "dashed") +
+    geom_vline(aes(xintercept = quantile(df[,input_list$x_trait], prob = (1 - n/100), na.rm = T)), color = "red", linetype = "dashed") +
+    labs(title = paste(input_list$mynursery, input_list$myyear, input_list$y_lab, "vs", input_list$x_lab, sep = " "), color = paste("Best ", n, "%", sep = ""), x = input_list$x_trait, y = input_list$y_trait) +
+    theme_bw()
+  return(best_plot)
+}
+
+#these functions apply regardless of which traits are selected
+#select the highlighted crosses
+get_best_viz <- function(df) {
+  df_best <- df %>%
+    dplyr::filter(best %in% c("yes"))
+  return(df_best)
+}
+
+#count the number of times a parent is included in the best crosses
+count_best_viz <- function(df) {
+  df_count <- df
+  no_crosses <- nrow(df_count)
+  p1count <- df_count %>% dplyr::count(Parent1, name = "Parent1_count") #count parent 1
+  p2count <- df_count %>% dplyr::count(Parent2, name = "Parent2_count") #count parent 2
+  parentCount <- full_join(p1count, p2count, by = c("Parent1" = "Parent2")) #join parent counts
+  colnames(parentCount)[1] <- c("Variety") 
+  parentCount <- parentCount %>% 
+      mutate(Total_count_topn = across(c(Parent1_count, Parent2_count)) %>% rowSums(na.rm = TRUE)) #calculate total count in parent df
+  parentCount <- parentCount %>% select(-c(Parent1_count, Parent2_count))
+  df_count <- left_join(df_count, parentCount, by = c("Parent1" = "Variety")) %>%
+    rename(P1_n = Total_count_topn)
+  df_count <- left_join(df_count, parentCount, by = c("Parent2" = "Variety")) %>%
+    rename(P2_n = Total_count_topn)
+  df_count <- df_count %>%
+    dplyr::select(Parent1, Parent2, P1_n, P2_n, everything())
+}
+
+
+```
+
+Now apply those functions to the data to identify and visualize the trait combinations of interest. In this example we will look at the best 10% of crosses for yield + test weight.
+
+```{r}
+
+#define inputs for yield and test weight
+input_list <- list(
+  n = 10, #quantile to keep
+  x_list = c("TW_LBBU_param.df.pred.mu", "TW_LBBU_param.df.mu.sp_high"), #x traits for the table
+  y_list = c("YLD_BUPA_param.df.pred.mu", "YLD_BUPA_param.df.mu.sp_high"), #y traits for the table
+  x_trait = c("TW_LBBU_param.df.pred.mu"), #x trait for the graph
+  y_trait = c("YLD_BUPA_param.df.pred.mu"), #y trait for the graph
+  x_lab = c("TW pred mu"), #x axis label for the graph
+  y_lab = c("YLD pred mu"), #y axis label for the graph
+  mynursery = c("Regional"), #nursery for the graph title
+  myyear = c("2024") #year for the graph title
+)
+
+#viz for the best crosses
+M1dat <- make_viz_data1(pred_out, input_list)
+M1dat_plot <- plot_viz_data1(M1dat, input_list)
+M1dat_plot
+ggsave(here::here("output_files", "M1dat_plot.pdf"), plot = M1dat_plot, width = 8, height = 8, units = "in")
+
+#get the best crosses
+#how many times were each of these parents included in the best crosses?
+M1dat_best <- get_best_viz(M1dat)
+M1dat_best_count <- count_best_viz(M1dat_best)
+
+#sort data and adjust column names
+M1dat_best_count <- M1dat_best_count %>%
+  arrange(desc(M1dat_best_count[input_list$y_trait]))
+
+
+
+```
+
+There are 81 crosses in this table. We could use this table to select some parents or crosses of interest for yield and test weight.
+
+We could also use this method to identify crosses for yield and one of our disease traits.
+
+Set our functions to include one variable where the low values are best/desirable.
+
+```{r}
+
+#make the data frame
+#add variables for selecting crosses
+make_viz_data2 <- function(df, input_list) {
+  n <- input_list$n
+  df_viz <- df %>%
+    dplyr::select(Parent1, Parent2, all_of(input_list$x_list), all_of(input_list$y_list)) %>%
+    dplyr::filter(!duplicated(.))
+  df_viz <- df_viz %>%
+    mutate(lowx = ifelse(df_viz[,input_list$x_trait] < quantile(df_viz[,input_list$x_trait], prob = (n/100), na.rm = T), "yes", "no"),
+           highy = ifelse(df_viz[,input_list$y_trait] > quantile(df_viz[,input_list$y_trait], prob = (1 - n/100), na.rm = T), "yes", "no"))
+  df_viz <- df_viz %>%
+    mutate(best = ifelse(lowx == "yes" & highy == "yes", "yes", "no"))
+  return(df_viz)
+}
+
+#make the plot
+plot_viz_data2 <- function(df, input_list) {
+  n = input_list$n
+  best_plot <- ggplot(df) +
+    geom_point(aes(x = get(input_list$x_trait), y = get(input_list$y_trait), color = best)) +
+    scale_color_manual(values = c("gray", "green")) +
+    geom_hline(aes(yintercept = quantile(df[,input_list$y_trait], prob = (1 - n/100), na.rm = T)), color = "red", linetype = "dashed") +
+    geom_vline(aes(xintercept = quantile(df[,input_list$x_trait], prob = (n/100), na.rm = T)), color = "red", linetype = "dashed") +
+    labs(title = paste(input_list$mynursery, input_list$myyear, input_list$y_lab, "vs", input_list$x_lab, sep = " "), color = paste("Best ", n, "%", sep = ""), x = input_list$x_trait, y = input_list$y_trait) +
+    theme_bw()
+  return(best_plot)
+}
+
+
+```
+
+Apply that to yield + powdery mildew.
+
+```{r}
+#define inputs for yield and test weight
+input_list <- list(
+  n = 10, #quantile to keep
+  x_list = c("PMD09_param.df.pred.mu", "PMD09_param.df.mu.sp_low"), #x traits for the table
+  y_list = c("YLD_BUPA_param.df.pred.mu", "YLD_BUPA_param.df.mu.sp_high"), #y traits for the table
+  x_trait = c("PMD09_param.df.pred.mu"), #x trait for the graph
+  y_trait = c("YLD_BUPA_param.df.pred.mu"), #y trait for the graph
+  x_lab = c("PMD pred mu"), #x axis label for the graph
+  y_lab = c("YLD pred mu"), #y axis label for the graph
+  mynursery = c("Regional"), #nursery for the graph title
+  myyear = c("2024") #year for the graph title
+)
+
+#viz for the best crosses
+M2dat <- make_viz_data2(pred_out, input_list)
+M2dat_plot <- plot_viz_data2(M2dat, input_list)
+M2dat_plot
+ggsave(here::here("output_files", "M2dat_plot.pdf"), plot = M2dat_plot, width = 8, height = 8, units = "in")
+
+#get the best crosses
+#how many times were each of these parents included in the best crosses?
+M2dat_best <- get_best_viz(M2dat)
+M2dat_best_count <- count_best_viz(M2dat_best)
+
+#sort data and adjust column names
+M2dat_best_count <- M2dat_best_count %>%
+  arrange(desc(M2dat_best_count[input_list$y_trait]))
+
+
+```
+
+There are 31 cross combinations here with the highest predicted yield and lowest predicted powdery mildew. If we wanted to increase yield and increase resistance we may be interested in these parents.
+
+
+Session Info
+
+```{r}
+sessionInfo <- sessionInfo()
+sessionInfo
+```
+
